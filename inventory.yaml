@@ -1,0 +1,33 @@
+---
+# 
+# 
+all:
+
+  children:
+
+    k3s_cluster:
+      vars:
+        ansible_python_interpreter: /usr/bin/python
+        ansible_user: berrypi-admin
+        ansible_ssh_private_key_file: /home/mrudolph/.ssh/id_rsa
+
+      children:
+        manager:
+          hosts:
+            pi-manager01:
+              ansible_host: 192.168.7.11
+              k3s_control_node: true 
+            pi-manager02:
+              ansible_host: 192.168.7.12
+            pi-manager03:
+              ansible_host: 192.168.7.13
+        worker:
+          hosts:
+            pi-worker01:
+              ansible_host: 192.168.7.21
+            pi-worker02:
+              ansible_host: 192.168.7.22
+            pi-worker03:
+              ansible_host: 192.168.7.23
+            pi-worker04:
+              ansible_host: 192.168.7.24
