@@ -1,0 +1,21 @@
+---
+- name: Hosts up-to-date
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Full system upgrade
+      ansible.builtin.apt:
+        update_cache: true
+        autoremove: true
+        upgrade: full
+
+    - name: Check if a reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+
+    - name: Display reboot status
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: Reboot {{ 'REQUIRED' if reboot_required_file.stat.exists else 'NOT required' }}"

@@ -1,0 +1,12 @@
+---
+- name: Restart all
+  hosts: all
+  become: true
+  gather_facts: true
+
+
+  tasks:
+
+    - name: Reboot the cloud
+      ansible.builtin.reboot:
+        msg: "{{ inventory_hostname }}: rebooting ..."
