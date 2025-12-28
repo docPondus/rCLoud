@@ -1,0 +1,241 @@
+---
+# prepare-k3s.yml
+- name: Vorbereitung der Raspberry Pis für k3s Cluster
+  hosts: manager:worker
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: System aktualisieren
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+        cache_valid_time: 3600
+
+    - name: Benötigte Pakete installieren
+      ansible.builtin.apt:
+        name:
+          - curl
+          - ca-certificates
+          - gnupg
+          - iptables
+          - dbus
+          - python3-apt
+        state: present
+
+    - name: Prüfen ob cgroup Parameter bereits vorhanden sind
+      ansible.builtin.shell:
+        cmd: grep -q 'cgroup_enable=cpuset' /boot/firmware/cmdline.txt && grep -q 'cgroup_memory=1' /boot/firmware/cmdline.txt && grep -q 'cgroup_enable=memory' /boot/firmware/cmdline.txt
+      register: cgroup_check
+      changed_when: false
+      failed_when: false
+
+    - name: Aktivieren von cgroup Memory und CPU
+      ansible.builtin.lineinfile:
+        path: /boot/firmware/cmdline.txt
+        backrefs: true
+        regexp: '^(.*rootwait.*)$'
+        line: '\1 cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory'
+      when: cgroup_check.rc != 0
+      register: cmdline_changed
+      notify: "System reboot"
+
+    - name: Prüfen ob HugePages Parameter bereits vorhanden sind
+      ansible.builtin.shell:
+        cmd: grep -q 'hugepagesz=2M' /boot/firmware/cmdline.txt && grep -q 'hugepages=512' /boot/firmware/cmdline.txt
+      register: hugepages_check
+      changed_when: false
+      failed_when: false
+
+    - name: Aktivieren von HugePages (2MB x 512 = 1GB RAM Reservierung)
+      ansible.builtin.lineinfile:
+        path: /boot/firmware/cmdline.txt
+        backrefs: true
+        regexp: '^(.*rootwait.*)$'
+        line: '\1 hugepagesz=2M hugepages=512'
+      when: hugepages_check.rc != 0
+      register: hugepages_changed
+      notify: "System reboot"
+
+    - name: Legacy-Modus für iptables setzen
+      community.general.alternatives:
+        name: iptables
+        path: /usr/sbin/iptables-legacy
+      tags: iptables_config
+
+    - name: Legacy-Modus für ip6tables setzen
+      community.general.alternatives:
+        name: ip6tables
+        path: /usr/sbin/ip6tables-legacy
+      tags: iptables_config
+
+    - name: Einträge in /etc/hosts für alle Cluster-Nodes erstellen
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        block: |
+          # k3s Cluster Nodes
+          {% for host in groups['manager'] + groups['worker'] %}
+          {{ hostvars[host]['ansible_host'] }} {{ host }}
+          {% endfor %}
+        marker: "# {mark} ANSIBLE MANAGED k3s CLUSTER"
+
+    - name: Prüfen ob dphys-swapfile installiert ist
+      ansible.builtin.stat:
+        path: /usr/sbin/dphys-swapfile
+      register: dphys_swapfile_binary
+
+    - name: Prüfen ob dphys-swapfile Service existiert
+      ansible.builtin.stat:
+        path: /etc/systemd/system/dphys-swapfile.service
+      register: dphys_swapfile_service
+
+    - name: Swap Status prüfen
+      ansible.builtin.command: swapon -s
+      register: swap_status
+      changed_when: false
+      failed_when: false
+
+    - name: Swap deaktivieren (swapoff)
+      ansible.builtin.command: dphys-swapfile swapoff
+      when:
+        - dphys_swapfile_binary.stat.exists
+        - swap_status.stdout | length > 0
+      failed_when: false
+      register: swap_off_result
+      changed_when: swap_off_result.rc == 0
+
+    - name: Swap deinstallieren (uninstall)
+      ansible.builtin.command: dphys-swapfile uninstall
+      when: dphys_swapfile_binary.stat.exists
+      failed_when: false
+      register: swap_uninstall_result
+      changed_when: swap_uninstall_result.rc == 0
+
+    - name: Service dphys-swapfile deaktivieren
+      ansible.builtin.systemd:
+        name: dphys-swapfile
+        enabled: false
+        state: stopped
+      when: dphys_swapfile_service.stat.exists
+      failed_when: false
+
+    - name: Swap aus /etc/fstab entfernen
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '.*swap.*'
+        state: absent
+
+    - name: IPv4 Forwarding aktivieren
+      ansible.builtin.sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        state: present
+        reload: true
+
+    - name: IPv6 Forwarding aktivieren
+      ansible.builtin.sysctl:
+        name: net.ipv6.conf.all.forwarding
+        value: '1'
+        state: present
+        reload: true
+
+    - name: Bridge netfilter Modul laden
+      community.general.modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: Bridge netfilter permanent aktivieren
+      ansible.builtin.lineinfile:
+        path: /etc/modules-load.d/k3s.conf
+        line: br_netfilter
+        mode: '0644'
+        create: true
+
+    - name: Bridge-nf-call-iptables aktivieren
+      ansible.builtin.sysctl:
+        name: net.bridge.bridge-nf-call-iptables
+        value: '1'
+        state: present
+        reload: true
+
+    - name: Bridge-nf-call-ip6tables aktivieren
+      ansible.builtin.sysctl:
+        name: net.bridge.bridge-nf-call-ip6tables
+        value: '1'
+        state: present
+        reload: true
+
+    - name: Verzeichnis für k3s Konfiguration erstellen
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: '0755'
+
+    - name: Reboot erforderlich prüfen
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+      changed_when: reboot_required_file.stat.exists
+      notify: "System reboot"
+
+  handlers:
+    - name: System reboot
+      ansible.builtin.reboot:
+        msg: "Reboot nach Konfigurationsänderung"
+        connect_timeout: 5
+        reboot_timeout: 300
+        pre_reboot_delay: 0
+        post_reboot_delay: 3
+      listen: "System reboot"
+
+    - name: Hinweis
+      ansible.builtin.debug:
+        msg: "Reboot erfolgte für {{ inventory_hostname }}"
+      listen: "System reboot"
+
+
+- name: Cluster-spezifische Vorbereitung
+  hosts: manager:worker
+  become: true
+  tasks:
+    - name: Token-Verzeichnis auf erstem Manager-Node erstellen
+      ansible.builtin.file:
+        path: /var/lib/rancher/k3s/server
+        state: directory
+        mode: '0755'
+      when: k3s_control_node is defined and k3s_control_node
+
+    - name: Prüfen ob Token bereits existiert
+      ansible.builtin.stat:
+        path: /var/lib/rancher/k3s/server/token
+      register: existing_token_file
+      when: k3s_control_node | default(false)
+
+    - name: Cluster-Token generieren (nur auf Control-Node wenn noch nicht vorhanden)
+      ansible.builtin.command: openssl rand -hex 32
+      register: generated_token
+      when:
+        - k3s_control_node | default(false)
+        - not existing_token_file.stat.exists
+      changed_when: false
+
+    - name: Token für spätere Verwendung speichern
+      ansible.builtin.copy:
+        content: "{{ generated_token.stdout }}"
+        dest: /var/lib/rancher/k3s/server/token
+        mode: '0600'
+      when:
+        - k3s_control_node is defined
+        - k3s_control_node
+        - generated_token.stdout is defined
+        - not existing_token_file.stat.exists
+
+    - name: Knotentyp bestimmen, Meldung vorbereiten
+      ansible.builtin.set_fact:
+        node_role: >-
+          {{ 'Manager (INITIAL)' if (k3s_control_node | default(false)) else
+             ('Manager' if inventory_hostname in groups['manager'] | default([]) else 'Worker' )}}
+
+    - name: Information ausgeben
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} ist bereit für die k3s Installation ({{ node_role }})"

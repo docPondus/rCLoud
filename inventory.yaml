@@ -1,63 +1,33 @@
 ---
+# 
+# 
 all:
 
   children:
 
-    docker_swarm:
+    k3s_cluster:
       vars:
-        ansible_python_interpreter: /usr/bin/python3
+        ansible_python_interpreter: /usr/bin/python
         ansible_user: berrypi-admin
-        ansible_ssh_private_key_file: /home/mrudolph/.ssh/id_rsa
-        ansible_become: yes
-        ansible_become_method: sudo
-        # Docker Swarm common variables
-        docker_swarm_network: 192.168.7.0/24
-        docker_swarm_advertise_addr: "{{ ansible_host }}"
+        ansible_ssh_private_key_file: ~/.ssh/id_rsa
 
       children:
-        swarm_managers:
-          vars:
-            node_role: manager
-            docker_swarm_manager: yes
+        manager:
           hosts:
             pi-manager01:
               ansible_host: 192.168.7.11
-              swarm_labels:
-                type: manager
-                zone: primary
+              k3s_control_node: true 
             pi-manager02:
               ansible_host: 192.168.7.12
-              swarm_labels:
-                type: manager
-                zone: secondary
             pi-manager03:
               ansible_host: 192.168.7.13
-              swarm_labels:
-                type: manager
-                zone: tertiary
-
-        swarm_workers:
-          vars:
-            node_role: worker
-            docker_swarm_manager: no
+        worker:
           hosts:
             pi-worker01:
               ansible_host: 192.168.7.21
-              swarm_labels:
-                type: worker
-                zone: compute-1
             pi-worker02:
               ansible_host: 192.168.7.22
-              swarm_labels:
-                type: worker
-                zone: compute-2
             pi-worker03:
               ansible_host: 192.168.7.23
-              swarm_labels:
-                type: worker
-                zone: compute-3
             pi-worker04:
               ansible_host: 192.168.7.24
-              swarm_labels:
-                type: worker
-                zone: compute-4

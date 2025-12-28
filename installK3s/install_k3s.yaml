@@ -1,0 +1,175 @@
+---
+# install-k3s.yml
+- name: K3s Cluster Installation
+  hosts: k3s_cluster
+  become: true
+
+  vars:
+    # Identifiziert den primären Master basierend auf dem Inventory
+    primary_master: >-
+      {{ groups['manager'] | map('extract', hostvars)
+         | selectattr('k3s_control_node', 'defined')
+         | selectattr('k3s_control_node', 'equalto', true)
+         | map(attribute='inventory_hostname') | first }}
+    token_path: /var/lib/rancher/k3s/server/token
+    k3s_install_script: /tmp/k3s_install.sh
+
+
+  tasks:
+    - name: K3s Service Status prüfen
+      ansible.builtin.systemd:
+        name: "{{ (inventory_hostname in groups['manager']) | ternary('k3s', 'k3s-agent') }}"
+      register: k3s_service_status
+      failed_when: false
+      check_mode: false
+
+    - name: K3s Installations-Skript herunterladen
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: "{{ k3s_install_script }}"
+        mode: '0700'
+      when: k3s_service_status.status.ActiveState | default('') != 'active'
+
+    - name: Existierenden Cluster-Token einlesen
+      ansible.builtin.slurp:
+        src: "{{ token_path }}"
+      register: existing_token_b64
+      when: inventory_hostname == primary_master
+
+    - name: Token als Fact für alle Hosts verfügbar machen
+      ansible.builtin.set_fact:
+        k3s_shared_token: "{{ hostvars[primary_master]['existing_token_b64'].content | b64decode | trim }}"
+      when: hostvars[primary_master]['existing_token_b64'] is defined
+
+    - name: Token-Validierung
+      ansible.builtin.fail:
+        msg: "Cluster-Token konnte nicht abgerufen werden. Bitte führen Sie aa_prepare-for-k3s.yaml zuerst aus."
+      when:
+        - inventory_hostname != primary_master
+        - k3s_shared_token is not defined or k3s_shared_token | length == 0
+
+    - name: K3s Verzeichnis erstellen
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: '0755'
+      when: inventory_hostname in groups['manager']
+
+    - name: K3s Konfigurationsdatei schreiben (Manager)
+      ansible.builtin.copy:
+        dest: /etc/rancher/k3s/config.yaml
+        content: |
+          # Deaktiviere k3s interne Komponenten
+          disable:
+            - servicelb
+            - local-storage
+          
+          # Zertifikats-Erweiterungen (SAN)
+          tls-san:
+            - "192.168.7.10"  # Die OPNsense VIP
+            - "{{ hostvars[inventory_hostname]['ansible_host'] }}"
+          
+          # Falls dies ein sekundärer Manager ist, füge die Server-URL hinzu
+          {% if inventory_hostname != primary_master %}
+          server: "https://{{ hostvars[primary_master]['ansible_host'] }}:6443"
+          {% endif %}
+        owner: root
+        group: root
+        mode: '0644'
+      when: inventory_hostname in groups['manager']
+      notify: Restart K3s
+
+    - name: K3s Server auf dem primären Master installieren
+      ansible.builtin.shell:
+        cmd: "{{ k3s_install_script }} server --cluster-init"
+      environment:
+        K3S_TOKEN: "{{ k3s_shared_token }}"
+      args:
+        creates: /usr/local/bin/k3s
+      when:
+        - inventory_hostname == primary_master
+        - k3s_service_status.status.ActiveState | default('') != 'active'
+      retries: 3
+      delay: 10
+      register: k3s_primary_install
+      until: k3s_primary_install is succeeded
+
+    - name: Warten bis primärer Master bereit ist
+      ansible.builtin.wait_for:
+        port: 6443
+        host: "{{ hostvars[primary_master]['ansible_host'] }}"
+        timeout: 120
+      when: inventory_hostname != primary_master
+
+    - name: Weitere Manager dem Cluster hinzufügen
+      ansible.builtin.shell:
+        cmd: "{{ k3s_install_script }} server"
+      environment:
+        K3S_TOKEN: "{{ k3s_shared_token }}"
+      args:
+        creates: /usr/local/bin/k3s
+      when: 
+        - inventory_hostname in groups['manager']
+        - inventory_hostname != primary_master        - k3s_service_status.status.ActiveState | default('') != 'active'
+      retries: 3
+      delay: 10
+      register: k3s_manager_install
+      until: k3s_manager_install is succeeded
+
+    - name: Worker (Agents) dem Cluster hinzufügen
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          {{ k3s_install_script }} agent \
+          --node-name {{ inventory_hostname }}
+        executable: /bin/bash
+      environment:
+        K3S_TOKEN: "{{ k3s_shared_token }}"
+        K3S_URL: "https://{{ hostvars[primary_master]['ansible_host'] }}:6443"
+      args:
+        creates: /usr/local/bin/k3s
+      when:
+        - inventory_hostname in groups['worker']
+        - k3s_service_status.status.ActiveState | default('') != 'active'
+      retries: 3
+      delay: 10
+      register: k3s_worker_install
+      until: k3s_worker_install is succeeded
+
+    - name: Lokales Installations-Skript entfernen
+      ansible.builtin.file:
+        path: "{{ k3s_install_script }}"
+        state: absent
+
+    - name: K3s Service-Status nach Installation prüfen
+      ansible.builtin.systemd:
+        name: "{{ (inventory_hostname in groups['manager']) | ternary('k3s', 'k3s-agent') }}"
+      register: k3s_post_install_status
+      failed_when: k3s_post_install_status.status.ActiveState != 'active'
+      retries: 5
+      delay: 10
+      until: k3s_post_install_status.status.ActiveState == 'active'
+
+    - name: Cluster-Gesundheitsprüfung (nur auf primärem Master)
+      ansible.builtin.command:
+        cmd: kubectl get nodes
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: cluster_nodes
+      changed_when: false
+      when: inventory_hostname == primary_master
+
+    - name: Cluster-Status anzeigen
+      ansible.builtin.debug:
+        msg: "{{ cluster_nodes.stdout_lines }}"
+      when:
+        - inventory_hostname == primary_master
+        - cluster_nodes.stdout_lines is defined
+
+  handlers:
+
+    - name: Restart K3s
+      ansible.builtin.systemd:
+        name: k3s
+        state: restarted
+
